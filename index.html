@@ -22,29 +22,29 @@
         let userId = 'anonymous'; // Default user ID
         
         // --- FIREBASE CONFIGURATION FIX FOR GITHUB PAGES ---
-        // 1. Define the hardcoded configuration for deployment.
+        // 1. Define the hardcoded configuration for deployment (REQUIRED for GitHub Pages).
+        // These keys were provided by the user.
         const externalFirebaseConfig = {
-            apiKey: "AIzaSyAoqiGAfHCvJ33V1bO42iwVkSm5agbpATo",
+            apiKey: "AIzaSyAoqiGAfHCvJ33V1bO42iwVkSm5agbpATo", 
             authDomain: "bingo-simulator-7cc3b.firebaseapp.com",
-            projectId: "bingo-simulator-7cc3b",
+            projectId: "bingo-simulator-7cc3b", 
             storageBucket: "bingo-simulator-7cc3b.firebasestorage.app",
             messagingSenderId: "898699042886",
-            appId: "1:898699042886:web:b9eb4b5e7eb277488d6a47",
-            measurementId: "G-3E33M1YBH3"
+            appId: "1:898699042886:web:b9eb4b5e7eb277488d6a47"
         };
 
-        // 2. Load Canvas-provided global variables (MANDATORY USE)
+        // 2. Load Canvas-provided global variables (MANDATORY USE when running in Canvas)
         const canvasAppId = typeof __app_id !== 'undefined' ? __app_id : null;
+        // This will be null on GitHub Pages, triggering the fallback.
         const canvasFirebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
         // 3. Select the final configuration
-        // Use Canvas config if available, otherwise use the hardcoded external config
+        // If Canvas config is available, use it. Otherwise, use the external/hardcoded config (for GitHub Pages).
         const firebaseConfig = canvasFirebaseConfig || externalFirebaseConfig;
         
-        // Use Canvas App ID if available, otherwise use the hardcoded external one
-        const appId = canvasAppId || externalFirebaseConfig.appId;
-
+        // Use the Canvas App ID if available, otherwise fallback to the hardcoded projectId
+        const appId = canvasAppId || firebaseConfig.projectId;
 
         // Game Constants
         const MIN_PLAYERS = 2;
@@ -92,19 +92,21 @@
         // --- Firebase/Firestore Logic ---
 
         const initFirebase = async () => {
-            // Check if Firebase config is valid (addresses the user's error)
-            if (!firebaseConfig || !firebaseConfig.apiKey) {
-                console.error("Firebase config is missing or invalid.");
-                showModal("Error", "Firebase configuration is not available. Cannot run the application.");
-                return;
+            // Check if Firebase config is valid before proceeding
+            if (!firebaseConfig || !firebaseConfig.apiKey || firebaseConfig.apiKey === "YOUR_API_KEY_HERE") {
+                console.error("Firebase configuration is missing or invalid. If running on GitHub Pages, ensure externalFirebaseConfig keys are updated.");
+                showModal("Configuration Error", "Firebase keys are missing. Please replace the placeholder API keys in the code.");
+                // Prevent further execution if config is clearly invalid
+                return; 
             }
             
             try {
+                // Initialize using the determined configuration
                 app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 auth = getAuth(app);
                 
-                // IMPORTANT: Use Canvas token if available, otherwise sign in anonymously
+                // Use Canvas token if available (in Canvas env), otherwise sign in anonymously (GitHub Pages/Local)
                 if (initialAuthToken) {
                     await signInWithCustomToken(auth, initialAuthToken);
                 } else {
@@ -655,7 +657,7 @@
 
                         cellClass += ` ${backgroundClass}`;
 
-                        // FIX APPLIED HERE: Using cardHtml to append the cell HTML
+                        // Using cardHtml to append the cell HTML
                         cardHtml += `<div class="${cellClass} aspect-square flex items-center justify-center text-lg rounded-sm shadow-inner">${isBlank ? '★' : number}</div>`;
                     }
                 }
@@ -758,7 +760,4 @@
     </div>
 
 </body>
-
-<!-- Forced re-deploy trigger -->
 </html>
-
