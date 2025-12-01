@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neil's Bingo Challenge</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // Firebase Imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Ensure Firebase logging is set to debug for easier development/troubleshooting
+        setLogLevel('Debug');
+
+        // Global Firebase variables
+        let app;
+        let db;
+        let auth;
+        let userId = 'anonymous'; // Default user ID
+        
+        // Canvas-provided global variables (MANDATORY USE)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'bingo-default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        // FIX: Corrected typo here to use __initial_auth_token instead of itself.
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Game Constants
+        const MIN_PLAYERS = 2;
+        const MAX_PLAYERS = 30; // Max supported by UI
+        const SLOTS_PER_CARD = 24; // 5x5 grid - 1 free space
+        const TOTAL_UNIQUE_NUMBERS = 99; // 1 to 99
+        const GAME_STATE_DOC_PATH = `/artifacts/${appId}/public/data/bingo_games/game-state`;
+
+        // Global Game State
+        let gameState = {
+            participants: 0,
+            playerNames: {},
+            calledNumbers: [],
+            cards: {},
+            claims: { Row: null, Column: null, Diagonal: null, House: null },
+            lastCalledNumber: 0,
+            status: 'setup' // 'setup', 'playing', 'finished'
+        };
+
+        // --- Utility Functions ---
+
+        // Custom Modal for Alerts/Confirmation
+        const showModal = (title, message) => {
+            const modal = document.getElementById('custom-modal');
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+            modal.classList.remove('hidden');
+        };
+
+        const hideModal = () => {
+            const modal = document.getElementById('custom-modal');
+            modal.classList.add('hidden');
+        };
+
+        // Fisher-Yates shuffle algorithm
+        const shuffleArray = (array) => {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+            return array;
+        };
+
+        // --- Firebase/Firestore Logic ---
+
+        const initFirebase = async () => {
+            if (!firebaseConfig) {
+                console.error("Firebase config is missing.");
+                showModal("Error", "Firebase configuration is not available. Cannot run the application.");
+                return;
+            }
+            
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                        setupGameListener();
+                    } else {
+                        userId = 'anonymous';
+                        document.getElementById('user-id-display').textContent = `User ID: Anonymous (Game may not save)`;
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                showModal("Initialization Error", `Failed to connect to Firebase: ${error.message}`);
+            }
+        };
+
+        const setupGameListener = () => {
+            const docRef = doc(db, GAME_STATE_DOC_PATH);
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    let loadedState = docSnap.data();
+                    
+                    // Convert JSON strings back to nested arrays for cards
+                    if (loadedState.cards) {
+                        for (const playerId in loadedState.cards) {
+                            try {
+                                if (typeof loadedState.cards[playerId] === 'string') {
+                                    loadedState.cards[playerId] = JSON.parse(loadedState.cards[playerId]);
+                                }
+                            } catch (e) {
+                                console.error(`Failed to parse card for ${playerId}`, e);
+                            }
+                        }
+                    }
+
+                    gameState = loadedState;
+                    renderGame();
+                } else {
+                    saveGameState();
+                }
+            }, (error) => {
+                console.error("Error listening to game state:", error);
+            });
+        };
+
+        const saveGameState = async () => {
+            if (!db) return;
+            try {
+                const docRef = doc(db, GAME_STATE_DOC_PATH);
+
+                // Convert nested arrays to JSON strings before saving
+                const stateToSave = { ...gameState };
+                stateToSave.cards = {};
+                for (const playerId in gameState.cards) {
+                    stateToSave.cards[playerId] = JSON.stringify(gameState.cards[playerId]);
+                }
+
+                await setDoc(docRef, stateToSave, { merge: true });
+                console.log("Game state saved.");
+            } catch (e) {
+                console.error("Error saving document: ", e);
+                showModal("Save Error", "Could not save game state to the database. Check console for details.");
+            }
+        };
+        
+        // --- Game Logic: Core Actions ---
+
+        // Resets the game state and saves it, forcing a new 'setup' view
+        const resetGame = async () => {
+            gameState = {
+                participants: 0,
+                playerNames: {},
+                calledNumbers: [],
+                cards: {},
+                claims: { Row: null, Column: null, Diagonal: null, House: null },
+                lastCalledNumber: 0,
+                status: 'setup' 
+            };
+            showModal("Game Reset", "The game has been reset! Please enter the number of participants to start a new challenge.");
+            await saveGameState();
+        };
+
+        // Creates the 5x5 card structure from 24 unique numbers.
+        const createPlayerCard = (playerNumbers) => {
+            // Note: playerNumbers is guaranteed to be an array of 24 unique numbers (1-99)
+            let numbers = shuffleArray([...playerNumbers]);
+            let card = Array(5).fill(0).map(() => Array(5).fill(0));
+            
+            let numberIndex = 0;
+            for (let r = 0; r < 5; r++) {
+                for (let c = 0; c < 5; c++) {
+                    if (r === 2 && c === 2) {
+                        card[r][c] = 0; // Blank center slot (marked by 0)
+                    } else {
+                        card[r][c] = numbers[numberIndex++];
+                    }
+                }
+            }
+            return card;
+        };
+
+        const startGame = async () => {
+            const input = document.getElementById('participant-input');
+            const numParticipants = parseInt(input.value);
+
+            if (isNaN(numParticipants) || numParticipants < MIN_PLAYERS || numParticipants > MAX_PLAYERS) {
+                showModal("Invalid Input", `Please enter a valid number of participants (${MIN_PLAYERS} to ${MAX_PLAYERS}).`);
+                return;
+            }
+            
+            const totalSlots = numParticipants * SLOTS_PER_CARD;
+
+            // --- Dynamic Number Distribution Logic (based on user's formula) ---
+            const Q = Math.floor(totalSlots / TOTAL_UNIQUE_NUMBERS); // Lower repetition count
+            const R = Math.ceil(totalSlots / TOTAL_UNIQUE_NUMBERS); // Upper repetition count (Q or Q+1)
+
+            // X: Number of unique numbers used R times (e.g., 3 times for 10 players)
+            const X = totalSlots - (Q * TOTAL_UNIQUE_NUMBERS);
+            // Y: Number of unique numbers used Q times (e.g., 2 times for 10 players)
+            const Y = TOTAL_UNIQUE_NUMBERS - X;
+
+            const allUniqueNumbers = Array.from({ length: TOTAL_UNIQUE_NUMBERS }, (_, i) => i + 1);
+            
+            // 1. Prepare the master assignment list (contains all slots, including repetitions)
+            let masterAssignment = [];
+            
+            // Add the first X unique numbers, R times (e.g., 42 numbers, 3 times each)
+            const numbersUsedRtimes = allUniqueNumbers.slice(0, X);
+            for (const num of numbersUsedRtimes) {
+                for (let k = 0; k < R; k++) masterAssignment.push(num);
+            }
+            
+            // Add the remaining Y unique numbers, Q times (e.g., 57 numbers, 2 times each)
+            const numbersUsedQtimes = allUniqueNumbers.slice(X);
+            for (const num of numbersUsedQtimes) {
+                for (let k = 0; k < Q; k++) masterAssignment.push(num);
+            }
+            
+            shuffleArray(masterAssignment); // Shuffle the entire pool of slots (e.g., 240 items)
+            
+            // 2. Distribute the numbers, ensuring unique numbers for each player
+            let availableSlots = masterAssignment;
+            let allCards = {};
+            let playerNames = {};
+
+            for (let i = 1; i <= numParticipants; i++) {
+                const playerId = `player${i}`;
+                const initialName = gameState.playerNames[playerId] || `Player ${i}`;
+                playerNames[playerId] = initialName;
+                
+                let playerNumbers = [];
+                let usedSlotIndices = {}; // To track indices used in availableSlots for this card
+                let passOverSlots = []; // Slots skipped due to local duplication
+
+                // Find 24 unique numbers for this card from the available pool
+                for (let j = 0; j < availableSlots.length && playerNumbers.length < SLOTS_PER_CARD; j++) {
+                    const currentNumber = availableSlots[j];
+
+                    if (playerNumbers.includes(currentNumber)) {
+                        // This number is already on the player's card (it's a repeat copy from the pool). 
+                        // Move this slot to the pass-over list for the next player.
+                        passOverSlots.push(currentNumber);
+                    } else {
+                        // Found a unique number for this card!
+                        playerNumbers.push(currentNumber);
+                        usedSlotIndices[j] = true; // Mark the slot as used/assigned
+                    }
+                }
+                
+                // 3. Reconstruct the remaining pool for the next player
+                let nextAvailableSlots = [];
+                for (let j = 0; j < availableSlots.length; j++) {
+                    // Include any slots that were not picked (i.e., not marked in usedSlotIndices)
+                    if (!usedSlotIndices[j]) {
+                        nextAvailableSlots.push(availableSlots[j]);
+                    }
+                }
+                // Add back the numbers we passed over because they were duplicates for the current player
+                availableSlots = nextAvailableSlots.concat(passOverSlots);
+                
+                // 4. Final Card Creation
+                if (playerNumbers.length !== SLOTS_PER_CARD) {
+                    // This should ideally not happen if the total slots are available
+                    showModal("Error", `Could not find ${SLOTS_PER_CARD} unique numbers for ${playerNames[playerId]}. The total unique numbers available might be exhausted.`);
+                    return;
+                }
+                
+                allCards[playerId] = createPlayerCard(playerNumbers);
+            }
+            // --- END FIXED DISTRIBUTION LOGIC ---
+            
+            // 5. Update Game State
+            gameState = {
+                participants: numParticipants,
+                playerNames: playerNames,
+                calledNumbers: [],
+                cards: allCards,
+                claims: { Row: null, Column: null, Diagonal: null, House: null },
+                lastCalledNumber: 0,
+                status: 'playing'
+            };
+
+            await saveGameState();
+        };
+
+        // --- Game Logic: Runtime ---
+
+        const callNumber = async () => {
+            if (gameState.status !== 'playing') {
+                showModal("Game Over", "The game has ended or is not yet started. Use 'Play Again' to start a new game.");
+                return;
+            }
+            if (Object.values(gameState.claims).every(c => c !== null)) {
+                gameState.status = 'finished';
+                await saveGameState();
+                showModal("Game Over!", "All win types (Row, Column, Diagonal, House) have been claimed. The game has ended.");
+                return;
+            }
+
+            let availableNumbers = Array.from({ length: 99 }, (_, i) => i + 1)
+                .filter(n => !gameState.calledNumbers.includes(n));
+            
+            if (availableNumbers.length === 0) {
+                gameState.status = 'finished'; 
+                await saveGameState();
+                showModal("No Numbers Left", "All 99 numbers have been called. The game is finished.");
+                return;
+            }
+
+            const randomIndex = Math.floor(Math.random() * availableNumbers.length);
+            const newNumber = availableNumbers[randomIndex];
+
+            gameState.calledNumbers.push(newNumber);
+            gameState.lastCalledNumber = newNumber;
+
+            await saveGameState();
+        };
+
+        const checkWinConditions = (card, calledNumbers) => {
+            const isMarked = (r, c) => (r === 2 && c === 2) || calledNumbers.includes(card[r][c]);
+
+            let rowMatch = false;
+            let colMatch = false;
+            let diagMatch = false;
+            let houseMatch = true;
+            
+            for (let i = 0; i < 5; i++) {
+                let rowCount = 0;
+                let colCount = 0;
+                for (let j = 0; j < 5; j++) {
+                    if (isMarked(i, j)) rowCount++;
+                    if (isMarked(j, i)) colCount++;
+                }
+                if (rowCount === 5) rowMatch = true;
+                if (colCount === 5) colMatch = true;
+            }
+
+            let diag1Count = 0; 
+            let diag2Count = 0; 
+            for (let i = 0; i < 5; i++) {
+                if (isMarked(i, i)) diag1Count++;
+                if (isMarked(i, 4 - i)) diag2Count++;
+            }
+            if (diag1Count === 5 || diag2Count === 5) diagMatch = true;
+
+            for (let r = 0; r < 5; r++) {
+                for (let c = 0; c < 5; c++) {
+                    if (r === 2 && c === 2) continue;
+                    if (!isMarked(r, c)) {
+                        houseMatch = false;
+                        break;
+                    }
+                }
+                if (!houseMatch) break;
+            }
+            
+            return { row: rowMatch, column: colMatch, diagonal: diagMatch, house: houseMatch };
+        };
+
+        const handleClaim = async (type) => {
+            const claimerId = document.getElementById('claimer-id-input').value.trim();
+            const playerIds = Object.keys(gameState.cards);
+
+            if (!playerIds.includes(claimerId)) {
+                showModal("Invalid ID", `Player ID '${claimerId}' is not valid. Please select a valid ID from the dropdown.`);
+                return;
+            }
+
+            if (gameState.claims[type] !== null) {
+                showModal("Claim Denied", `${type} has already been claimed by ${gameState.claims[type]}.`);
+                return;
+            }
+
+            const card = gameState.cards[claimerId];
+            const winStatus = checkWinConditions(card, gameState.calledNumbers);
+            
+            const playerDisplayName = gameState.playerNames[claimerId] || claimerId;
+            const hasMatch = (type === 'Row' && winStatus.row) ||
+                             (type === 'Column' && winStatus.column) ||
+                             (type === 'Diagonal' && winStatus.diagonal) ||
+                             (type === 'House' && winStatus.house);
+
+            if (hasMatch) {
+                gameState.claims[type] = playerDisplayName;
+                
+                showModal("Claim Approved!", `🎉 ${playerDisplayName} has successfully claimed the ${type} win!`);
+
+                if (Object.values(gameState.claims).every(c => c !== null)) {
+                    gameState.status = 'finished';
+                }
+                
+                await saveGameState();
+            } else {
+                showModal("Claim Denied", `The app record shows that ${playerDisplayName} does not currently have a match for ${type}.`);
+            }
+        };
+
+
+        // --- UI Rendering ---
+        
+        const getClaimButton = (type, color) => {
+            const isClaimed = gameState.claims[type] !== null;
+            const disabledAttr = isClaimed ? 'disabled' : '';
+            const colorClass = isClaimed ? 'bg-gray-400 cursor-not-allowed shadow-inner' : `${color} hover:${color.replace('500', '600')}`;
+            return `<button onclick="handleClaim('${type}')" ${disabledAttr} class="claim-btn ${colorClass}">Claim ${type}</button>`;
+        };
+
+        const checkLineMatch = (card, calledNumbers, type, index = -1) => {
+            const isMarked = (r, c) => (r === 2 && c === 2) || calledNumbers.includes(card[r][c]);
+
+            if (type === 'row') {
+                for (let c = 0; c < 5; c++) if (!isMarked(index, c)) return false;
+                return true;
+            } else if (type === 'column') {
+                for (let r = 0; r < 5; r++) if (!isMarked(r, index)) return false;
+                return true;
+            } else if (type === 'diag1') { 
+                for (let i = 0; i < 5; i++) if (!isMarked(i, i)) return false;
+                return true;
+            } else if (type === 'diag2') {
+                for (let i = 0; i < 5; i++) if (!isMarked(i, 4 - i)) return false;
+                return true;
+            }
+            return false;
+        };
+
+        const updatePlayerName = (playerId, newName) => {
+            const trimmedName = newName.trim().substring(0, 10);
+            gameState.playerNames[playerId] = trimmedName || playerId;
+            saveGameState();
+        };
+
+        window.updatePlayerName = updatePlayerName;
+
+        const renderGame = () => {
+            const setupDiv = document.getElementById('setup-ui');
+            const playingDiv = document.getElementById('playing-ui');
+            const cardsContainer = document.getElementById('cards-container');
+            const claimsContentDiv = document.getElementById('claims-content');
+            const calledNumbersContentDiv = document.getElementById('called-numbers-content');
+            const historyCountSpan = document.getElementById('history-count');
+            
+            // --- 1. Control Visibility / Setup Mode ---
+            if (gameState.status === 'setup') {
+                setupDiv.classList.remove('hidden');
+                playingDiv.classList.add('hidden');
+                
+                setupDiv.innerHTML = `
+                    <h2 class="text-xl font-bold mb-4 text-indigo-800">Start a New Game</h2>
+                    <div class="flex flex-col sm:flex-row space-y-3 sm:space-y-0 sm:space-x-3">
+                        <input id="participant-input" type="number" min="${MIN_PLAYERS}" max="${MAX_PLAYERS}" value="${MIN_PLAYERS}" placeholder="Number of participants (2-${MAX_PLAYERS})" 
+                               class="p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 w-full sm:w-60">
+                        <button onclick="startGame()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition duration-150 ease-in-out">
+                            Setup Cards
+                        </button>
+                    </div>
+                    <p class="mt-4 text-sm text-gray-600">Enter participants (Max ${MAX_PLAYERS}) to generate cards, ensuring a fair distribution of numbers based on total slots.</p>
+                `;
+                
+                cardsContainer.innerHTML = '<p class="text-gray-400 p-4">Enter the number of participants above to begin a game.</p>';
+                claimsContentDiv.innerHTML = '<p class="text-gray-400">Claims status will appear here.</p>';
+                calledNumbersContentDiv.innerHTML = '<p class="text-gray-400">No numbers called yet.</p>';
+
+                historyCountSpan.textContent = '0 / 99';
+                
+                return;
+            }
+            
+            // --- 2. Playing Controls (Status is 'playing' or 'finished') ---
+            setupDiv.classList.add('hidden');
+            playingDiv.classList.remove('hidden');
+
+            const lastNumber = gameState.lastCalledNumber || '---';
+            const statusColor = gameState.status === 'finished' ? 'bg-pink-100 text-pink-700 border-pink-500' : 'bg-green-100 text-green-700 border-green-500';
+
+            playingDiv.innerHTML = `
+                <div class="flex flex-col sm:flex-row items-center justify-between p-4 mb-6 border-2 rounded-xl shadow-md ${statusColor}">
+                    <div class="text-center sm:text-left mb-4 sm:mb-0">
+                        <p class="text-sm font-semibold uppercase">Last Number Called:</p>
+                        <p class="text-4xl font-extrabold">${lastNumber}</p>
+                    </div>
+                    <button onclick="callNumber()" 
+                            ${gameState.status === 'finished' ? 'disabled' : ''}
+                            class="w-full sm:w-auto bg-green-600 hover:bg-green-700 text-white font-extrabold py-3 px-8 rounded-full shadow-xl transform transition duration-150 ease-in-out active:scale-95 disabled:bg-gray-400 disabled:cursor-not-allowed">
+                        ${gameState.status === 'finished' ? 'Game Finished' : 'Call Next Number'}
+                    </button>
+                </div>
+                
+                <div class="p-4 bg-gray-50 border rounded-xl shadow-inner">
+                    <h3 class="text-lg font-bold mb-3 text-gray-700">Claim a Win</h3>
+                    
+                    <label for="claimer-id-input" class="block text-sm font-medium text-gray-600 mb-1">Select Player to Claim:</label>
+                    <select id="claimer-id-input" 
+                            class="p-2 border border-gray-300 rounded-lg w-full mb-3 focus:ring-indigo-500 focus:border-indigo-500">
+                        ${Object.keys(gameState.cards).map(id => `
+                            <option value="${id}">${gameState.playerNames[id] || id} (${id})</option>
+                        `).join('')}
+                    </select>
+
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        ${getClaimButton('Row', 'bg-blue-500')}
+                        ${getClaimButton('Column', 'bg-green-500')}
+                        ${getClaimButton('Diagonal', 'bg-yellow-500')}
+                        ${getClaimButton('House', 'bg-pink-500')}
+                    </div>
+                </div>
+            `;
+            
+            // --- 3. Claims Status Content ---
+            claimsContentDiv.innerHTML = `
+                <div class="grid grid-cols-2 gap-3">
+                    ${Object.entries(gameState.claims).map(([type, claimant]) => {
+                        let baseClasses = 'p-3 rounded-lg shadow-sm border transition-all duration-300';
+                        let typeColorClass = '';
+                        let typeTextColor = 'text-gray-500';
+
+                        if (claimant) {
+                            // Assign color based on the type claimed
+                            switch (type) {
+                                case 'Row':
+                                    typeColorClass = 'bg-blue-500 border-blue-700';
+                                    typeTextColor = 'text-white';
+                                    break;
+                                case 'Column':
+                                    typeColorClass = 'bg-green-500 border-green-700';
+                                    typeTextColor = 'text-white';
+                                    break;
+                                case 'Diagonal':
+                                    typeColorClass = 'bg-yellow-500 border-yellow-700';
+                                    typeTextColor = 'text-gray-900'; // Dark text for yellow background
+                                    break;
+                                case 'House':
+                                    typeColorClass = 'bg-pink-500 border-pink-700';
+                                    typeTextColor = 'text-white';
+                                    break;
+                            }
+                        } else {
+                            // Default styling for unclaimed
+                            typeColorClass = 'bg-white border-dashed border-gray-300';
+                            typeTextColor = 'text-gray-400';
+                        }
+
+                        return `
+                            <div class="${baseClasses} ${typeColorClass}">
+                                <p class="font-semibold text-sm ${typeTextColor}">${type}</p>
+                                <p class="font-bold ${typeTextColor}">
+                                    ${claimant ? claimant : 'Unclaimed'}
+                                </p>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            `;
+            
+            // --- 4. Called Numbers History Content ---
+            historyCountSpan.textContent = `${gameState.calledNumbers.length} / 99`;
+            
+            calledNumbersContentDiv.innerHTML = gameState.calledNumbers.length > 0
+                ? gameState.calledNumbers.map(n => `<span class="bg-gray-100 text-gray-700 font-medium px-2 py-1 rounded-full text-sm">${n}</span>`).join('')
+                : '<p class="text-gray-400">No numbers called yet.</p>';
+            
+            // --- 5. Render Cards ---
+            cardsContainer.innerHTML = '';
+            
+            Object.keys(gameState.cards).forEach(playerId => {
+                const card = gameState.cards[playerId];
+                const playerDisplayName = gameState.playerNames[playerId] || playerId;
+                const winStatus = checkWinConditions(card, gameState.calledNumbers);
+                
+                let cardHtml = '';
+                
+                let cardClass = 'shadow-xl bg-white border-2';
+                if (gameState.claims.House === playerDisplayName) cardClass = 'shadow-pink-400/50 border-pink-500 bg-pink-50';
+                else if (gameState.claims.Row === playerDisplayName || gameState.claims.Column === playerDisplayName || gameState.claims.Diagonal === playerDisplayName) cardClass = 'shadow-yellow-400/50 border-yellow-500 bg-yellow-50';
+                else if (winStatus.house) cardClass = 'shadow-pink-400/30 border-pink-300 bg-white';
+                
+                cardHtml += `<div class="p-4 rounded-xl transition-all duration-300 ${cardClass}">`;
+                
+                // INLINE NAME EDIT
+                cardHtml += `
+                    <div class="mb-3 text-center">
+                        <input type="text" 
+                               value="${playerDisplayName}" 
+                               maxlength="10" 
+                               onchange="updatePlayerName('${playerId}', this.value)"
+                               class="text-xl font-extrabold text-center w-full bg-transparent border-b-2 border-dashed border-gray-300 focus:border-indigo-500 focus:outline-none truncate"
+                               title="Edit Player Name (ID: ${playerId})">
+                    </div>
+                `;
+                
+                cardHtml += `<div class="grid grid-cols-5 gap-0.5 border border-gray-300 rounded-lg overflow-hidden">`;
+
+                // Render Grid Cells
+                for (let r = 0; r < 5; r++) {
+                    for (let c = 0; c < 5; c++) {
+                        const number = card[r][c];
+                        const isBlank = (r === 2 && c === 2);
+                        const isMatched = isBlank || gameState.calledNumbers.includes(number);
+
+                        let cellClass = 'p-3 text-center font-bold transition duration-200 ease-in-out text-gray-800';
+                        
+                        const hasRowWin = winStatus.row && gameState.claims.Row === playerDisplayName;
+                        const hasColWin = winStatus.column && gameState.claims.Column === playerDisplayName;
+                        const hasDiagWin = winStatus.diagonal && gameState.claims.Diagonal === playerDisplayName;
+                        
+                        const isOnDiag1 = (r === c);
+                        const isOnDiag2 = (r + c === 4);
+
+                        let backgroundClass = isMatched ? 'bg-teal-200 text-teal-800' : 'bg-gray-100 text-gray-800';
+                        if (isBlank) backgroundClass = 'bg-gray-500 text-white';
+
+                        if (gameState.claims.House === playerDisplayName) {
+                             backgroundClass = 'bg-pink-500 text-white shadow-inner shadow-pink-200';
+                        } else if (isMatched) {
+                            if (hasRowWin && checkLineMatch(card, gameState.calledNumbers, 'row', r)) backgroundClass = 'bg-blue-500 text-white';
+                            if (hasColWin && checkLineMatch(card, gameState.calledNumbers, 'column', c)) backgroundClass = 'bg-green-500 text-white';
+                            if (hasDiagWin) {
+                                if (isOnDiag1 && checkLineMatch(card, gameState.calledNumbers, 'diag1')) backgroundClass = 'bg-yellow-500 text-white';
+                                if (isOnDiag2 && checkLineMatch(card, gameState.calledNumbers, 'diag2')) backgroundClass = 'bg-yellow-500 text-white';
+                            }
+                        }
+
+                        cellClass += ` ${backgroundClass}`;
+
+                        // FIX APPLIED HERE: Using cardHtml to append the cell HTML
+                        cardHtml += `<div class="${cellClass} aspect-square flex items-center justify-center text-lg rounded-sm shadow-inner">${isBlank ? '★' : number}</div>`;
+                    }
+                }
+                cardHtml += `</div>`;
+                cardHtml += `</div>`;
+                cardsContainer.innerHTML += cardHtml;
+            });
+
+        };
+        
+        // Expose functions globally for HTML access
+        window.startGame = startGame;
+        window.callNumber = callNumber;
+        window.handleClaim = handleClaim;
+        window.hideModal = hideModal;
+        window.resetGame = resetGame; // Exposed reset function
+        
+        // Initialize Firebase when the window loads
+        window.onload = initFirebase;
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f4f7f9;
+        }
+        .claim-btn {
+            @apply text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-150 ease-in-out transform hover:scale-[1.02] active:scale-95 disabled:hover:scale-100 disabled:shadow-none;
+        }
+        /* Custom styles for claimed lines - prevents overlap with other colors */
+        .bg-blue-500 { background-color: #3b82f6 !important; } /* Row */
+        .bg-green-500 { background-color: #10b981 !important; } /* Column */
+        .bg-yellow-500 { background-color: #f59e0b !important; } /* Diagonal */
+        .bg-pink-500 { background-color: #ec4899 !important; } /* House */
+        
+        /* Better contrast for matched numbers */
+        .bg-teal-200 { background-color: #ccfbf1 !important; } /* Matched Number Background */
+        .text-teal-800 { color: #134e4a !important; } /* Matched Number Text */
+    </style>
+</head>
+<body class="p-4 sm:p-8 min-h-screen">
+
+    <div class="max-w-7xl mx-auto">
+        <h1 class="text-3xl sm:text-4xl font-extrabold mb-6 text-indigo-700 border-b-4 border-indigo-200 pb-2">Neil's Bingo Challenge</h1>
+        
+        <p id="user-id-display" class="text-sm text-gray-500 mb-6"></p>
+
+        <!-- Game Controls (Reserved Height to prevent CLS) -->
+        <div id="game-controls" class="mb-8 p-6 bg-white rounded-xl shadow-lg border border-gray-100 min-h-[16rem]">
+            <div id="setup-ui">
+                <!-- Setup content is injected here -->
+            </div>
+            <div id="playing-ui" class="hidden">
+                <!-- Playing content is injected here -->
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+            <!-- 1. Claims Status - STATIC CONTAINER -->
+            <div class="p-6 bg-white rounded-xl shadow-lg border border-gray-100 h-fit">
+                <h3 class="text-lg font-bold mb-3 text-gray-700">Claimed Wins Status</h3>
+                <div id="claims-content">
+                    <!-- Dynamic claims content rendered here -->
+                </div>
+            </div>
+            
+            <!-- 2. Called Numbers History - STATIC CONTAINER with FIXED HEIGHT -->
+            <div class="p-6 bg-white rounded-xl shadow-lg border border-gray-100 h-fit">
+                <h3 class="text-lg font-bold mb-3 text-gray-700">Called Numbers (<span id="history-count">0 / 99</span>)</h3>
+                <div id="called-numbers-content" class="flex flex-wrap gap-2 p-3 bg-white border rounded-lg h-40 overflow-y-auto">
+                    <!-- Dynamic number spans rendered here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Player Cards Container - RESERVED MINIMUM HEIGHT -->
+        <h2 class="text-2xl font-bold mb-4 text-gray-700 mt-6">Player Bingo Cards</h2>
+        <div id="cards-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 min-h-[300px]">
+            <!-- Bingo Cards rendered here -->
+        </div>
+    </div>
+    
+    <!-- Play Again Button (Centered at bottom) -->
+    <div class="max-w-7xl mx-auto mt-12 mb-8 text-center">
+        <button onclick="resetGame()" class="bg-red-600 hover:bg-red-700 text-white font-extrabold py-3 px-10 rounded-full shadow-2xl transition duration-150 ease-in-out transform active:scale-95 text-lg">
+            🔄 Play Again (Reset Game)
+        </button>
+    </div>
+
+    <!-- Custom Modal -->
+    <div id="custom-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40" onclick="hideModal()">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full mx-4" onclick="event.stopPropagation()">
+            <h3 id="modal-title" class="text-2xl font-bold mb-4 text-indigo-700">Alert</h3>
+            <p id="modal-message" class="text-gray-700 mb-6"></p>
+            <button onclick="hideModal()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 rounded-lg transition duration-150">
+                Got It
+            </button>
+        </div>
+    </div>
+
+</body>
+</html>
